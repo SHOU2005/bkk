@@ -1,0 +1,319 @@
+<parameter name="content">"""
+Excel Processor - Extract transactions from XLS/XLSX bank statements
+Enhanced with multiple column detection patterns and better parsing
+"""
+
+import pandas as pd
+import re
+from io import BytesIO
+from typing import List, Dict, Any, Optional
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class ExcelProcessor:
+    """Process XLS/XLSX files and extract bank statement transactions."""
+    
+    def __init__(self):
+        # Common column name patterns for date detection
+        self.date_patterns = [
+            r'date', r'dt', r'transaction.?date', r'post.?date', 
+            r'value.?date', r'time', r'month', r'day'
+        ]
+        
+        # Common column name patterns for description/narration
+        self.desc_patterns = [
+            r'description', r'desc', r'narration', r'particulars',
+            r'details', r'remarks', r'memo', r'narrative', r'transaction.?desc'
+        ]
+        
+        # Common column name patterns for amount
+        self.amount_patterns = [
+            r'amount', r'amt', r'value', r'sum', r'rs', r'rupees',
+            r'txn.?amount', r'transaction.?amt', r'transaction.?value'
+        ]
+        
+        # Credit column patterns
+        self.credit_patterns = [
+            r'credit', r'cr', r'cr.?amount', r'credit.?amt',
+            r'credit.?value', r'deposit', r'received', r' inflows?'
+        ]
+        
+        # Debit column patterns
+        self.debit_patterns = [
+            r'debit', r'dr', r'dr.?amount', r'debit.?amt',
+            r'debit.?value', r'withdrawal', r'paid', r' outflows?'
+        ]
+        
+        # UPI patterns in description
+        self.upi_patterns = [
+            r'upi[/]?', r'@upi', r'merchant.?upi', r'upi.?transfer',
+            r'upi/[a-z0-9]+', r'[?&]pa=', r'[?&]pn='
+        ]
+        
+        # Transfer patterns
+        self.transfer_patterns = [
+            r'transfer', r'neft', r'imps', r'rtgs', r'wallet.?transfer',
+            r'bank.?transfer', r'acc.?transfer', r'a/c.?transfer'
+        ]
+        
+    def _get_column_mapping(self, df: pd.DataFrame) -> Dict[str, str]:
+        """Auto-detect and map column names to standard names."""
+        columns = df.columns.str.lower().tolist()
+        col_map = {}
+        
+        # Find date column
+        for i, col in enumerate(columns):
+            if any(re.search(pattern, col) for pattern in self.date_patterns):
+                col_map['date'] = df.columns[i]
+                break
+        else:
+            # Try to find a date-like column by checking values
+            for i, col in enumerate(df.columns):
+                try:
+                    sample = str(df[col].dropna().iloc[0]) if len(df[col].dropna()) > 0 else ""
+                    if re.search(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', sample) or \
+                       re.search(r'\d{4}[/-]\d{1,2}[/-]\d{1,2}', sample):
+                        col_map['date'] = df.columns[i]
+                        break
+                except:
+                    continue
+        
+        # Find description column
+        for i, col in enumerate(columns):
+            if any(re.search(pattern, col) for pattern in self.desc_patterns):
+                col_map['description'] = df.columns[i]
+                break
+        
+        # Find amount column (credit OR debit separate columns)
+        has_credit = False
+        has_debit = False
+        
+        for i, col in enumerate(columns):
+            if not has_credit and any(re.search(pattern, col) for pattern in self.credit_patterns):
+                col_map['credit'] = df.columns[i]
+                has_credit = True
+            elif not has_debit and any(re.search(pattern, col) for pattern in self.debit_patterns):
+                col_map['debit'] = df.columns[i]
+                has_debit = True
+        
+        # If no separate credit/debit columns, look for single amount column
+        if 'credit' not in col_map and 'debit' not in col_map:
+            for i, col in enumerate(columns):
+                if col_map.get('date') == df.columns[i] or col_map.get('description') == df.columns[i]:
+                    continue
+                if any(re.search(pattern, col) for pattern in self.amount_patterns):
+                    col_map['amount'] = df.columns[i]
+                    break
+        
+        return col_map
+    
+    def _clean_amount(self, value) -> float:
+        """Convert various amount formats to float."""
+        if pd.isna(value):
+            return 0.0
+        if isinstance(value, (int, float)):
+            return float(value)
+        
+        # Handle string amounts
+        val_str = str(value).strip()
+        
+        # Remove currency symbols and commas
+        val_str = re.sub(r'[₹$€£,]', '', val_str)
+        
+        # Handle (100) or -100 as negative
+        if re.match(r'^\(.*\)$', val_str):
+            val_str = '-' + val_str.strip('()')
+        
+        try:
+            return float(val_str)
+        except:
+            return 0.0
+    
+    def _clean_date(self, value) -> str:
+        """Convert various date formats to standard string."""
+        if pd.isna(value):
+            return ""
+        
+        if isinstance(value, str):
+            # Already a string, try to clean
+            value = value.strip()
+            # Remove extra whitespace
+            value = re.sub(r'\s+', ' ', value)
+            return value
+        
+        try:
+            # Try pandas datetime conversion
+            dt = pd.to_datetime(value)
+            return dt.strftime('%d/%m/%Y')
+        except:
+            return str(value)
+    
+    def _clean_description(self, value) -> str:
+        """Clean and normalize description text."""
+        if pd.isna(value):
+            return ""
+        val_str = str(value).strip()
+        # Remove extra whitespace
+        val_str = re.sub(r'\s+', ' ', val_str)
+        # Remove leading/trailing special chars
+        val_str = val_str.strip('-_.,; ')
+        return val_str
+    
+    def _detect_transaction_type(self, description: str, is_upi: bool, is_transfer: bool) -> Dict[str, bool]:
+        """Detect transaction type flags from description."""
+        desc_lower = description.lower() if description else ""
+        
+        # UPI detection
+        if is_upi or any(re.search(p, desc_lower) for p in self.upi_patterns):
+            return {'is_upi': True, 'is_transfer': True}
+        
+        # Transfer detection
+        if is_transfer or any(re.search(p, desc_lower) for p in self.transfer_patterns):
+            return {'is_upi': False, 'is_transfer': True}
+        
+        # Check for wallet/banking keywords
+        wallet_patterns = [r'wallet', r'paytm', r'phonepe', r'gpay', r'phone.?pe', r'google.?pay']
+        if any(re.search(p, desc_lower) for p in wallet_patterns):
+            return {'is_upi': True, 'is_transfer': True}
+        
+        return {'is_upi': False, 'is_transfer': False}
+    
+    def extract_transactions(self, file_bytes: bytes, filename: str = "") -> List[Dict[str, Any]]:
+        """
+        Extract transactions from XLS/XLSX file.
+        
+        Args:
+            file_bytes: Raw file content
+            filename: Original filename (for debugging)
+            
+        Returns:
+            List of transaction dictionaries
+        """
+        transactions = []
+        
+        try:
+            # Try reading as Excel first (xlsx)
+            try:
+                df = pd.read_excel(BytesIO(file_bytes), dtype=str)
+                logger.info(f"Successfully read {filename} as XLSX")
+            except Exception as e:
+                # Fallback to xls
+                try:
+                    df = pd.read_excel(BytesIO(file_bytes), engine='xlrd', dtype=str)
+                    logger.info(f"Successfully read {filename} as XLS (xlrd)")
+                except Exception as e2:
+                    # Try openpyxl for xls
+                    try:
+                        df = pd.read_excel(BytesIO(file_bytes), engine='openpyxl', dtype=str)
+                        logger.info(f"Successfully read {filename} as XLS (openpyxl)")
+                    except Exception as e3:
+                        logger.error(f"Failed to read {filename}: {e3}")
+                        raise ValueError(f"Unable to read Excel file: {str(e3)}")
+            
+            # Clean dataframe - remove completely empty rows
+            df = df.dropna(how='all')
+            
+            if df.empty:
+                logger.warning(f"No data found in {filename}")
+                return transactions
+            
+            # Get column mapping
+            col_map = self._get_column_mapping(df)
+            
+            if not col_map:
+                logger.warning(f"Could not identify columns in {filename}")
+                # Try using all columns as fallback
+                col_map = {col: col for col in df.columns}
+            
+            logger.info(f"Column mapping for {filename}: {col_map}")
+            
+            # Process each row
+            for idx, row in df.iterrows():
+                try:
+                    # Skip rows that are mostly empty
+                    non_empty = row.dropna()
+                    if len(non_empty) == 0:
+                        continue
+                    
+                    # Extract values
+                    date = ""
+                    description = ""
+                    amount = 0.0
+                    credit = 0.0
+                    debit = 0.0
+                    
+                    # Date
+                    if 'date' in col_map:
+                        date = self._clean_date(row.get(col_map['date']))
+                    
+                    # Description
+                    if 'description' in col_map:
+                        description = self._clean_description(row.get(col_map['description']))
+                    
+                    # If no description column, concatenate remaining columns
+                    if not description:
+                        parts = []
+                        for col in df.columns:
+                            if col not in [col_map.get('date'), col_map.get('credit'), col_map.get('debit'), col_map.get('amount')]:
+                                val = row.get(col)
+                                if pd.notna(val) and str(val).strip():
+                                    parts.append(str(val).strip())
+                        description = ' '.join(parts[:3])  # Limit to first 3 non-key columns
+                    
+                    # Amount handling
+                    if 'credit' in col_map and 'debit' in col_map:
+                        credit = self._clean_amount(row.get(col_map['credit']))
+                        debit = self._clean_amount(row.get(col_map['debit']))
+                    elif 'amount' in col_map:
+                        amount = self._clean_amount(row.get(col_map['amount']))
+                        # Determine if credit or debit based on sign or description
+                        if amount < 0:
+                            debit = abs(amount)
+                        else:
+                            credit = amount
+                    
+                    # Skip rows with no meaningful data
+                    if not date and not description and credit == 0 and debit == 0:
+                        continue
+                    
+                    # Detect transaction type
+                    type_info = self._detect_transaction_type(
+                        description, 
+                        False,  # Will be refined
+                        False   # Will be refined
+                    )
+                    
+                    # Final amount calculation
+                    final_amount = credit if credit > 0 else debit
+                    
+                    # Skip if still no valid data
+                    if final_amount == 0 and not description:
+                        continue
+                    
+                    txn = {
+                        'date': date,
+                        'description': description,
+                        'amount': final_amount,
+                        'credit': credit,
+                        'debit': debit,
+                        'category': 'general',
+                        'is_upi': type_info['is_upi'],
+                        'is_transfer': type_info['is_transfer']
+                    }
+                    
+                    transactions.append(txn)
+                    
+                except Exception as row_error:
+                    logger.warning(f"Error processing row {idx}: {row_error}")
+                    continue
+            
+            logger.info(f"Extracted {len(transactions)} transactions from {filename}")
+            
+        except Exception as e:
+            logger.error(f"Error processing {filename}: {str(e)}", exc_info=True)
+            raise ValueError(f"Failed to process Excel file: {str(e)}")
+        
+        return transactions
+</parameter>

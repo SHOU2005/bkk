@@ -1,0 +1,32 @@
+# AcuTrace - Party Ledger & Fund Flow Intelligence
+# Core Dependencies - Supports PDF and XLS/XLSX
+
+# Web Framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+aiofiles==23.2.1
+
+# Data Processing
+numpy==1.24.3
+pandas==2.1.3
+
+# PDF Processing
+pdfplumber==0.10.3
+PyPDF2==3.0.1
+
+# Validation
+pydantic==2.5.0
+
+# Security & Encryption
+python-jose[cryptography]==3.3.0
+cryptography==41.0.7
+
+# Export & Reporting
+qrcode[pil]==7.4.2
+reportlab==4.0.7
+Pillow==10.1.0
+
+# Configuration
+python-dotenv==1.0.0
+
